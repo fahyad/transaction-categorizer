@@ -101,10 +101,29 @@ const S = {
   undoBtn: { background: "#2A2F5A", border: "1px solid #3D4470", borderRadius: 6, color: "#FBBF24", padding: "4px 10px", cursor: "pointer", fontSize: 11, fontWeight: 600 },
 };
 
-function InputScreen({ onParse, mappingCount, catCount, onManage, onResume, savedSession }) {
+function sessionLabel(txns) {
+  const dates = txns.map(t => t.date).filter(Boolean).sort();
+  if (!dates.length) return "No dates";
+  const fmt = d => { const p = d.split("-"); return new Date(p[0], p[1]-1, p[2]).toLocaleDateString("en-US", { month: "short", day: "numeric" }); };
+  if (dates.length === 1) return fmt(dates[0]);
+  return fmt(dates[0]) + " \u2013 " + fmt(dates[dates.length - 1]);
+}
+
+function sessionStats(txns) {
+  const total = txns.length;
+  const catd = txns.filter(t => t.category && t.category !== SKIP_CAT && t.confirmed).length;
+  const skipped = txns.filter(t => t.category === SKIP_CAT).length;
+  const remaining = total - catd - skipped;
+  const pct = total > 0 ? Math.round((catd / total) * 100) : 0;
+  return { total, catd, skipped, remaining, pct };
+}
+
+function InputScreen({ onParse, mappingCount, catCount, onManage, onResume, onDeleteSession, sessions }) {
   const [csv, setCsv] = useState("");
   const [err, setErr] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [showSessions, setShowSessions] = useState(false);
+  const [confirmDelId, setConfirmDelId] = useState(null);
   const fileRef = React.useRef(null);
 
   const handleFile = (file) => {
@@ -122,17 +141,52 @@ function InputScreen({ onParse, mappingCount, catCount, onManage, onResume, save
     else setErr("Please drop a .csv file.");
   };
 
+  const incomplete = sessions.filter(s => sessionStats(s.txns).remaining > 0);
+  const complete = sessions.filter(s => sessionStats(s.txns).remaining === 0);
+
   return e("div", { style: S.screen },
     e("div", { style: { padding: "24px 20px", maxWidth: 600, margin: "0 auto" } },
       e("h1", { style: { fontSize: 22, fontWeight: 800, marginBottom: 4 } }, "Transaction Categorizer"),
       e("p", { style: { color: "#9BA4B5", fontSize: 13, marginBottom: 20 } }, "Paste your Scotiabank CSV"),
 
-      savedSession && e("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 } },
-        e("button", { onClick: onResume, style: { flex: 1, background: "#1B1F3B", border: "1px solid #3D4470", borderLeft: "4px solid #4ADE80", borderRadius: 10, padding: "14px 16px", cursor: "pointer", textAlign: "left" } },
-          e("div", { style: { fontSize: 14, fontWeight: 700, color: "#FFF", marginBottom: 4 } }, "Resume Previous Session"),
-          e("div", { style: { fontSize: 12, color: "#9BA4B5" } }, savedSession.summary)),
-        e("button", { onClick: () => { storage.del("saved-csv"); storage.del("saved-txn-state"); onResume(true); },
-          style: { background: "none", border: "none", color: "#6B7280", fontSize: 12, cursor: "pointer", padding: "4px 8px", whiteSpace: "nowrap", textDecoration: "underline" } }, "Clear saved")),
+      sessions.length > 0 && e("div", { style: { marginBottom: 20 } },
+        e("button", { onClick: () => setShowSessions(!showSessions),
+          style: { width: "100%", background: "#151933", border: "1px solid #3D4470", borderRadius: 10, padding: "14px 16px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" } },
+          e("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
+            e("span", { style: { fontSize: 18 } }, "\uD83D\uDCC2"),
+            e("span", { style: { fontSize: 14, fontWeight: 700, color: "#FFF" } }, "Previous Sessions"),
+            e("span", { style: { background: "#6C63FF", borderRadius: 10, padding: "2px 8px", fontSize: 11, fontWeight: 700, color: "#FFF" } }, sessions.length)),
+          e("span", { style: { color: "#9BA4B5", fontSize: 14, transition: "transform 0.2s", transform: showSessions ? "rotate(180deg)" : "rotate(0)" } }, "\u25BC")),
+
+        showSessions && e("div", { style: { marginTop: 8 } },
+          incomplete.length > 0 && e("div", { style: { fontSize: 11, fontWeight: 700, color: "#FBBF24", marginBottom: 8, marginTop: 8, textTransform: "uppercase" } }, "In Progress"),
+          incomplete.map(s => {
+            const st = sessionStats(s.txns);
+            return e("div", { key: s.id, style: { background: "#2A2F5A", borderRadius: 10, borderLeft: "4px solid #FBBF24", padding: "14px 16px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12 } },
+              e("div", { style: { flex: 1, cursor: "pointer", minWidth: 0 }, onClick: () => onResume(s.id) },
+                e("div", { style: { fontSize: 14, fontWeight: 700, color: "#FFF", marginBottom: 4 } }, sessionLabel(s.txns)),
+                e("div", { style: { fontSize: 12, color: "#9BA4B5", marginBottom: 6 } }, st.total + " transactions \u00B7 " + st.catd + " done, " + st.remaining + " remaining"),
+                e("div", { style: { background: "#1B1F3B", borderRadius: 4, height: 4, overflow: "hidden" } },
+                  e("div", { style: { background: "#FBBF24", height: "100%", width: st.pct + "%", transition: "width 0.3s" } }))),
+              confirmDelId === s.id ?
+                e("div", { style: { display: "flex", flexDirection: "column", gap: 4, flexShrink: 0 } },
+                  e("button", { onClick: () => { onDeleteSession(s.id); setConfirmDelId(null); }, style: { background: "#F87171", border: "none", borderRadius: 4, color: "#FFF", padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 } }, "Delete"),
+                  e("button", { onClick: () => setConfirmDelId(null), style: { background: "#1B1F3B", border: "none", borderRadius: 4, color: "#9BA4B5", padding: "4px 10px", fontSize: 11, cursor: "pointer" } }, "Cancel"))
+              : e("button", { onClick: () => setConfirmDelId(s.id), style: { background: "none", border: "none", color: "#3D4470", cursor: "pointer", fontSize: 16, padding: "4px 8px", flexShrink: 0 } }, "\u2715"));
+          }),
+          complete.length > 0 && e("div", { style: { fontSize: 11, fontWeight: 700, color: "#4ADE80", marginBottom: 8, marginTop: 12, textTransform: "uppercase" } }, "Completed"),
+          complete.map(s => {
+            const st = sessionStats(s.txns);
+            return e("div", { key: s.id, style: { background: "#2A2F5A", borderRadius: 10, borderLeft: "4px solid #4ADE80", padding: "14px 16px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12 } },
+              e("div", { style: { flex: 1, cursor: "pointer", minWidth: 0 }, onClick: () => onResume(s.id) },
+                e("div", { style: { fontSize: 14, fontWeight: 700, color: "#FFF", marginBottom: 4 } }, sessionLabel(s.txns)),
+                e("div", { style: { fontSize: 12, color: "#9BA4B5" } }, st.total + " transactions \u00B7 all categorized")),
+              confirmDelId === s.id ?
+                e("div", { style: { display: "flex", flexDirection: "column", gap: 4, flexShrink: 0 } },
+                  e("button", { onClick: () => { onDeleteSession(s.id); setConfirmDelId(null); }, style: { background: "#F87171", border: "none", borderRadius: 4, color: "#FFF", padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 } }, "Delete"),
+                  e("button", { onClick: () => setConfirmDelId(null), style: { background: "#1B1F3B", border: "none", borderRadius: 4, color: "#9BA4B5", padding: "4px 10px", fontSize: 11, cursor: "pointer" } }, "Cancel"))
+              : e("button", { onClick: () => setConfirmDelId(s.id), style: { background: "none", border: "none", color: "#3D4470", cursor: "pointer", fontSize: 16, padding: "4px 8px", flexShrink: 0 } }, "\u2715"));
+          }))),
 
       e("div", { onClick: () => fileRef.current && fileRef.current.click(),
         onDragOver: (ev) => { ev.preventDefault(); setDragging(true); },
@@ -313,32 +367,32 @@ function App() {
   const [copied, setCopied] = useState(false);
   const [history, setHistory] = useState([]);
   const [initKnown, setInitKnown] = useState(0);
-  const [savedSession, setSavedSession] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
 
   useEffect(() => {
     const m = storage.get("cat-mappings"); if (m) setMappings(m);
     const c = storage.get("custom-cats"); if (c) setCategories([...DEFAULT_CATEGORIES, ...c]);
-    checkSavedSession();
+    // Migrate old single-session format
+    const oldState = storage.get("saved-txn-state");
+    if (oldState && oldState.txns && oldState.txns.length > 0) {
+      const existing = storage.get("saved-sessions") || [];
+      const migrated = { id: "migrated-" + Date.now(), txns: oldState.txns, phase: oldState.phase, initKnown: oldState.initKnown || 0, savedAt: oldState.savedAt || new Date().toISOString() };
+      storage.set("saved-sessions", [...existing, migrated]);
+      storage.del("saved-txn-state"); storage.del("saved-csv");
+    }
+    setSessions(storage.get("saved-sessions") || []);
   }, []);
 
-  const checkSavedSession = () => {
-    const state = storage.get("saved-txn-state");
-    if (state && state.txns && state.txns.length > 0) {
-      const catd = state.txns.filter(t => t.category && t.category !== SKIP_CAT && t.confirmed).length;
-      const rem = state.txns.length - catd;
-      const d = state.savedAt ? new Date(state.savedAt) : null;
-      const dateStr = d ? d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
-      setSavedSession({ summary: state.txns.length + " transactions from " + dateStr + " \u2014 " + catd + " categorized, " + rem + " remaining", state });
-    } else {
-      setSavedSession(null);
-    }
-  };
+  const saveSessions = (updated) => { storage.set("saved-sessions", updated); setSessions(updated); };
 
   const saveState = (newTxns, newPhase) => {
-    storage.set("saved-txn-state", { txns: newTxns, phase: newPhase, initKnown, savedAt: new Date().toISOString() });
+    if (!activeSessionId) return;
+    const updated = sessions.map(s => s.id === activeSessionId ? { ...s, txns: newTxns, phase: newPhase, initKnown, savedAt: new Date().toISOString() } : s);
+    saveSessions(updated);
   };
 
-  const clearSaved = () => { storage.del("saved-csv"); storage.del("saved-txn-state"); setSavedSession(null); };
+  const deleteSession = (id) => { saveSessions(sessions.filter(s => s.id !== id)); };
 
   const saveMap = m => { setMappings(m); storage.set("cat-mappings", m); };
   const saveCats = allCats => { storage.set("custom-cats", allCats.filter(c => !DEFAULT_CATEGORIES.some(d => d.name === c.name))); };
@@ -364,17 +418,20 @@ function App() {
     setInitKnown(k);
     const newPhase = k > 0 ? "confirm" : "categorize";
     setPhase(newPhase);
-    storage.set("saved-csv", csvText);
-    saveState(w, newPhase);
+    const sid = "session-" + Date.now();
+    setActiveSessionId(sid);
+    const newSession = { id: sid, txns: w, phase: newPhase, initKnown: k, savedAt: new Date().toISOString() };
+    const updated = [...sessions, newSession];
+    saveSessions(updated);
   };
 
-  const handleResume = (clearing) => {
-    if (clearing) { setSavedSession(null); return; }
-    if (!savedSession || !savedSession.state) return;
-    const s = savedSession.state;
+  const handleResume = (sessionId) => {
+    const s = sessions.find(x => x.id === sessionId);
+    if (!s) return;
     setTxns(s.txns);
     setInitKnown(s.initKnown || 0);
     setHistory([]);
+    setActiveSessionId(s.id);
     const k = s.txns.filter(t => t.category && t.category !== SKIP_CAT && !t.confirmed);
     const u = s.txns.filter(t => !t.category);
     if (s.phase === "confirm" && k.length > 0) setPhase("confirm");
@@ -391,13 +448,13 @@ function App() {
   const reject = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, "confirm"); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: null, confirmed: false } : x); saveState(u, "confirm"); return u; }); };
   const assign = (id, cat) => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, phase); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: cat, confirmed: true } : x); const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize"; saveState(u, newPhase); return u; }); if (t && cat !== SKIP_CAT) saveMap({ ...mappings, [t.payee.toLowerCase()]: cat }); if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200); };
   const skip = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, phase); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: SKIP_CAT, confirmed: true } : x); const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize"; saveState(u, newPhase); return u; }); if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200); };
-  const copy = () => { const rows = txns.filter(t => t.category && t.category !== SKIP_CAT).map(t => t.date + "\t" + t.payee + "\t" + t.category + "\t" + t.subDesc + "\t" + t.amount).join("\n"); navigator.clipboard.writeText(rows).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); clearSaved(); }); };
+  const copy = () => { const rows = txns.filter(t => t.category && t.category !== SKIP_CAT).map(t => t.date + "\t" + t.payee + "\t" + t.category + "\t" + t.subDesc + "\t" + t.amount).join("\n"); navigator.clipboard.writeText(rows).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); }); };
 
-  if (phase === "input") return e(InputScreen, { onParse: handleParse, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, savedSession });
+  if (phase === "input") return e(InputScreen, { onParse: handleParse, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, onDeleteSession: deleteSession, sessions });
   if (phase === "manage") return e(ManageScreen, { categories, onAdd: cat => { if (categories.some(c => c.name.toLowerCase() === cat.name.toLowerCase())) return; const u = [...categories, cat]; setCategories(u); saveCats(u); }, onDelete: name => { const u = categories.filter(c => c.name !== name); setCategories(u); saveCats(u); }, onBack: () => setPhase("input") });
   if (phase === "confirm" && known.length > 0) return e(ConfirmScreen, { txn: known[0], onConfirm: confirm, onReject: reject, onSkipAll: () => { setTxns(p => { const u = p.map(t => t.category && !t.confirmed ? { ...t, confirmed: true } : t); saveState(u, unknown.length > 0 ? "categorize" : "summary"); return u; }); setPhase(unknown.length > 0 ? "categorize" : "summary"); }, onUndo: undo, canUndo: history.length > 0, remaining: known.length, total: initKnown });
   if ((phase === "categorize" || phase === "confirm") && unknown.length > 0) return e(CategorizeScreen, { txn: unknown[0], categories, onAssign: assign, onSkip: skip, onDone: () => setPhase("summary"), onUndo: undo, canUndo: history.length > 0, progress, remaining: unknown.length });
-  return e(SummaryScreen, { transactions: txns, categories, onCopy: copy, onBack: () => setPhase("categorize"), onRestart: () => { setTxns([]); setPhase("input"); setCopied(false); setHistory([]); clearSaved(); }, copied });
+  return e(SummaryScreen, { transactions: txns, categories, onCopy: copy, onBack: () => setPhase("categorize"), onRestart: () => { setTxns([]); setPhase("input"); setCopied(false); setHistory([]); setActiveSessionId(null); setSessions(storage.get("saved-sessions") || []); }, copied });
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(e(App));
