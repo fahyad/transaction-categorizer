@@ -58,35 +58,24 @@ const storage = {
   del(key) { try { localStorage.removeItem(key); } catch(e) {} }
 };
 
-function parseCSVLine(line) {
-  const fields = []; let current = ""; let inQ = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') { if (inQ && line[i+1] === '"') { current += '"'; i++; } else inQ = !inQ; }
-    else if (ch === ',' && !inQ) { fields.push(current.trim()); current = ""; }
-    else current += ch;
-  }
-  fields.push(current.trim());
-  return fields;
-}
-
-function parseCSV(text) {
-  const lines = text.trim().split("\n").map(l => l.trim()).filter(l => l.length > 0);
-  if (lines.length < 2) return [];
-  const txns = [];
-  for (let i = 1; i < lines.length; i++) {
-    const f = parseCSVLine(lines[i]);
-    if (f.length < 7) continue;
-    const [, date, desc, subDesc, status, txnType, amountStr] = f;
-    if (!date || !amountStr) continue;
-    const num = parseFloat(amountStr);
-    if (isNaN(num)) continue;
-    if (desc.toLowerCase().includes("payment from")) continue;
-    const amt = txnType === "Debit" ? -Math.abs(num) : Math.abs(num);
-    const payee = desc.split("#")[0].split(/\d{3}-\d{3}/).at(0)?.trim() || desc;
-    txns.push({ id: String(i), date, amount: amt, status, payee: payee.charAt(0).toUpperCase() + payee.slice(1), rawDesc: desc, subDesc: subDesc || "", category: null });
-  }
-  return txns;
+// Transform sheet data to transaction format
+function transformSheetTransaction(row) {
+  const isDebit = row.transactionType && (row.transactionType.toLowerCase().includes("authorization") || row.transactionType.toLowerCase().includes("purchase") || row.transactionType.toLowerCase().includes("withdrawal"));
+  const amount = parseFloat(row.amount) || 0;
+  const amt = isDebit ? -Math.abs(amount) : Math.abs(amount);
+  const merchant = row.merchant || "";
+  const payee = merchant.charAt(0).toUpperCase() + merchant.slice(1);
+  const subDesc = (row.accountType || "") + (row.accountType && row.account ? " " : "") + (row.account || "");
+  return {
+    id: String(row.row),
+    date: row.date ? (typeof row.date === "string" ? row.date : new Date(row.date).toISOString().split("T")[0]) : "",
+    amount: amt,
+    payee: payee,
+    rawDesc: merchant,
+    subDesc: subDesc,
+    category: null,
+    sheetRow: row.row,
+  };
 }
 
 const S = {
@@ -118,36 +107,90 @@ function sessionStats(txns) {
   return { total, catd, skipped, remaining, pct };
 }
 
-function InputScreen({ onParse, mappingCount, catCount, onManage, onResume, onDeleteSession, sessions }) {
-  const [csv, setCsv] = useState("");
+function SettingsModal({ onClose, onSave }) {
+  const [url, setUrl] = useState(storage.get("webapp-url") || "");
   const [err, setErr] = useState("");
-  const [dragging, setDragging] = useState(false);
-  const [showSessions, setShowSessions] = useState(false);
-  const [confirmDelId, setConfirmDelId] = useState(null);
-  const fileRef = React.useRef(null);
 
-  const handleFile = (file) => {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => { setCsv(ev.target.result); setErr(""); };
-    reader.onerror = () => setErr("Failed to read file.");
-    reader.readAsText(file);
+  const handleSave = () => {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      setErr("Please enter a URL");
+      return;
+    }
+    storage.set("webapp-url", trimmed);
+    onSave(trimmed);
   };
 
-  const onDrop = (ev) => {
-    ev.preventDefault(); setDragging(false);
-    const file = ev.dataTransfer.files[0];
-    if (file && file.name.endsWith(".csv")) handleFile(file);
-    else setErr("Please drop a .csv file.");
+  return e("div", { style: { position: "fixed", inset: 0, background: "#00000088", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 } },
+    e("div", { style: { background: "#2A2F5A", borderRadius: 14, padding: 24, width: "90%", maxWidth: 400 } },
+      e("h3", { style: { fontSize: 18, fontWeight: 700, marginBottom: 16 } }, "Google Apps Script URL"),
+      e("input", { type: "text", value: url, onChange: ev => { setUrl(ev.target.value); setErr(""); }, placeholder: "https://script.google.com/...",
+        style: { width: "100%", background: "#1B1F3B", border: "1px solid #3D4470", borderRadius: 8, color: "#FFF", fontSize: 14, padding: "10px 12px", outline: "none", boxSizing: "border-box", marginBottom: 12 } }),
+      err && e("div", { style: { background: "#F8717122", border: "1px solid #F87171", borderRadius: 8, padding: "8px 12px", marginBottom: 12, color: "#F87171", fontSize: 12 } }, err),
+      e("div", { style: { display: "flex", gap: 8 } },
+        e("button", { onClick: onClose, style: { ...S.bigBtn, flex: 1, background: "#1B1F3B", border: "1px solid #3D4470", color: "#9BA4B5" } }, "Cancel"),
+        e("button", { onClick: handleSave, style: { ...S.bigBtn, flex: 1, background: "#6C63FF", color: "#FFF" } }, "Save"))
+    )
+  );
+}
+
+function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDeleteSession, sessions, onSettingsOpen }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [uncategorizedCount, setUncategorizedCount] = useState(null);
+  const [showSessions, setShowSessions] = useState(false);
+  const [confirmDelId, setConfirmDelId] = useState(null);
+
+  const handleFetch = async () => {
+    setLoading(true);
+    setErr("");
+    setUncategorizedCount(null);
+
+    try {
+      const url = storage.get("webapp-url");
+      if (!url) {
+        setErr("Please configure the Google Apps Script URL first.");
+        setLoading(false);
+        return;
+      }
+
+      const response = await fetch(url, { redirect: "follow" });
+      if (!response.ok) {
+        const text = await response.text();
+        try {
+          const data = JSON.parse(text);
+          if (!data.transactions || !Array.isArray(data.transactions)) throw new Error("Invalid response");
+          const txns = data.transactions.map(transformSheetTransaction);
+          setUncategorizedCount(txns.length);
+          onFetch(txns);
+        } catch (parseErr) {
+          setErr("Failed to parse response. Ensure the web app is deployed and returns JSON.");
+        }
+      } else {
+        const data = await response.json();
+        if (!data.transactions || !Array.isArray(data.transactions)) throw new Error("Invalid response");
+        const txns = data.transactions.map(transformSheetTransaction);
+        setUncategorizedCount(txns.length);
+        onFetch(txns);
+      }
+    } catch (ex) {
+      setErr("Failed to fetch transactions: " + (ex.message || "Unknown error"));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const incomplete = sessions.filter(s => sessionStats(s.txns).remaining > 0);
   const complete = sessions.filter(s => sessionStats(s.txns).remaining === 0);
+  const webappUrl = storage.get("webapp-url");
 
   return e("div", { style: S.screen },
     e("div", { style: { padding: "24px 20px", maxWidth: 600, margin: "0 auto" } },
-      e("h1", { style: { fontSize: 22, fontWeight: 800, marginBottom: 4 } }, "Transaction Categorizer"),
-      e("p", { style: { color: "#9BA4B5", fontSize: 13, marginBottom: 20 } }, "Paste your Scotiabank CSV"),
+      e("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } },
+        e("div", null,
+          e("h1", { style: { fontSize: 22, fontWeight: 800, marginBottom: 4 } }, "Transaction Categorizer"),
+          e("p", { style: { color: "#9BA4B5", fontSize: 13 } }, "Connect to Google Sheets")),
+        e("button", { onClick: onSettingsOpen, style: { background: "none", border: "1px solid #3D4470", borderRadius: 8, color: "#9BA4B5", padding: "6px 10px", cursor: "pointer", fontSize: 16 } }, "\u2699\uFE0F")),
 
       sessions.length > 0 && e("div", { style: { marginBottom: 20 } },
         e("button", { onClick: () => setShowSessions(!showSessions),
@@ -188,28 +231,18 @@ function InputScreen({ onParse, mappingCount, catCount, onManage, onResume, onDe
               : e("button", { onClick: () => setConfirmDelId(s.id), style: { background: "none", border: "none", color: "#3D4470", cursor: "pointer", fontSize: 16, padding: "4px 8px", flexShrink: 0 } }, "\u2715"));
           }))),
 
-      e("div", { onClick: () => fileRef.current && fileRef.current.click(),
-        onDragOver: (ev) => { ev.preventDefault(); setDragging(true); },
-        onDragLeave: () => setDragging(false),
-        onDrop: onDrop,
-        style: { border: "2px dashed " + (dragging ? "#6C63FF" : "#3D4470"), borderRadius: 12, padding: "28px 16px", textAlign: "center", cursor: "pointer", background: dragging ? "#6C63FF11" : "#151933", marginBottom: 12, transition: "border-color 0.2s, background 0.2s", minHeight: 44 } },
-        e("div", { style: { fontSize: 28, marginBottom: 8 } }, "\uD83D\uDCC1"),
-        e("div", { style: { fontSize: 15, fontWeight: 700, color: "#FFF", marginBottom: 4 } }, "Upload CSV File"),
-        e("div", { style: { fontSize: 12, color: "#9BA4B5" } }, "Tap to select or drag & drop"),
-        e("input", { ref: fileRef, type: "file", accept: ".csv", style: { display: "none" },
-          onChange: (ev) => { handleFile(ev.target.files[0]); ev.target.value = ""; } })),
+      e("div", { style: { ...S.txnCard } },
+        e("div", { style: { fontSize: 13, color: "#9BA4B5", marginBottom: 8 } }, "Connected to:"),
+        e("div", { style: { fontSize: 14, fontWeight: 600, color: "#FFF", wordBreak: "break-all", marginBottom: 16, fontFamily: "monospace", background: "#1B1F3B", padding: 12, borderRadius: 6, minHeight: 40, display: "flex", alignItems: "center" } }, webappUrl || "Not configured"),
+        uncategorizedCount !== null && e("div", { style: { fontSize: 13, color: "#4ADE80", marginBottom: 12 } }, "\u2713 Found " + uncategorizedCount + " uncategorized transactions")),
 
-      e("div", { style: { textAlign: "center", color: "#6B7280", fontSize: 13, marginBottom: 12 } }, "or paste CSV manually"),
-
-      e("div", { style: { background: "#151933", borderRadius: 10, border: "1px solid #3D4470", padding: 16, marginBottom: 16 } },
-        e("div", { style: { color: "#9BA4B5", fontSize: 12, marginBottom: 8 } }, "Scotia OnLine \u2192 Account \u2192 Download Transactions \u2192 CSV"),
-        e("textarea", { value: csv, onChange: ev => { setCsv(ev.target.value); setErr(""); }, placeholder: "Paste CSV here...",
-          style: { width: "100%", height: 200, background: "#1B1F3B", border: "1px solid #2A2F5A", borderRadius: 6, color: "#FFF", fontFamily: "monospace", fontSize: 11, padding: 14, resize: "vertical", outline: "none", boxSizing: "border-box" } })
-      ),
       err && e("div", { style: { background: "#F8717122", border: "1px solid #F87171", borderRadius: 8, padding: "8px 12px", marginBottom: 16, color: "#F87171", fontSize: 13 } }, err),
-      e("button", { onClick: () => { setErr(""); const p = parseCSV(csv); if (!p.length) { setErr("No transactions found."); return; } onParse(csv, p); }, disabled: !csv.trim(),
-        style: { ...S.primaryBtn, marginTop: 0, opacity: csv.trim() ? 1 : 0.4, width: "100%" } }, "Parse & Categorize \u2192"),
-      mappingCount > 0 && e("p", { style: { color: "#4ADE80", fontSize: 12, marginTop: 10, textAlign: "center" } }, "\u2713 " + mappingCount + " saved mappings"),
+
+      e("button", { onClick: handleFetch, disabled: loading || !webappUrl,
+        style: { ...S.primaryBtn, marginTop: 0, opacity: (loading || !webappUrl) ? 0.4 : 1, width: "100%", marginBottom: 16 } },
+        loading ? "Fetching\u2026" : "Fetch Transactions \u2192"),
+
+      mappingCount > 0 && e("p", { style: { color: "#4ADE80", fontSize: 12, marginBottom: 16, textAlign: "center" } }, "\u2713 " + mappingCount + " saved mappings"),
       e("button", { onClick: onManage, style: { background: "none", border: "1px solid #3D4470", borderRadius: 10, padding: 12, color: "#9BA4B5", fontSize: 13, cursor: "pointer", width: "100%", marginTop: 24 } }, "\u2699\uFE0F Manage Categories (" + catCount + ")")
     )
   );
@@ -354,7 +387,7 @@ function SummaryScreen({ transactions, categories, onCopy, onBack, onRestart, co
       e("button", { onClick: onCopy, style: { ...S.primaryBtn, width: "100%", marginBottom: 10 } }, copied ? "\u2713 Copied to Clipboard!" : "\u{1F4CB} Copy " + categorized.length + " for Excel"),
       e("div", { style: { display: "flex", gap: 10 } },
         uncategorized.length > 0 && e("button", { onClick: onBack, style: { ...S.bigBtn, flex: 1, background: "#2A2F5A", color: "#FFF" } }, "\u2190 " + uncategorized.length + " remaining"),
-        e("button", { onClick: onRestart, style: { ...S.bigBtn, flex: 1, background: "#1B1F3B", border: "1px solid #3D4470", color: "#9BA4B5" } }, "New CSV"))
+        e("button", { onClick: onRestart, style: { ...S.bigBtn, flex: 1, background: "#1B1F3B", border: "1px solid #3D4470", color: "#9BA4B5" } }, "New Fetch"))
     )
   );
 }
@@ -369,6 +402,7 @@ function App() {
   const [initKnown, setInitKnown] = useState(0);
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     const m = storage.get("cat-mappings"); if (m) setMappings(m);
@@ -410,7 +444,7 @@ function App() {
     if (last.phase !== phase) setPhase(last.phase);
   };
 
-  const handleParse = (csvText, parsed) => {
+  const handleFetch = (parsed) => {
     setHistory([]);
     const w = parsed.map(t => { const s = mappings[t.payee.toLowerCase()]; return s ? { ...t, category: s } : t; });
     setTxns(w);
@@ -446,11 +480,35 @@ function App() {
 
   const confirm = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, "confirm"); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, confirmed: true } : x); const newPhase = known.filter(x => x.id !== id).length === 0 ? (unknown.length > 0 ? "categorize" : "summary") : "confirm"; saveState(u, newPhase); return u; }); if (known.filter(x => x.id !== id).length === 0) setPhase(unknown.length > 0 ? "categorize" : "summary"); };
   const reject = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, "confirm"); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: null, confirmed: false } : x); saveState(u, "confirm"); return u; }); };
-  const assign = (id, cat) => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, phase); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: cat, confirmed: true } : x); const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize"; saveState(u, newPhase); return u; }); if (t && cat !== SKIP_CAT) saveMap({ ...mappings, [t.payee.toLowerCase()]: cat }); if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200); };
+  const assign = (id, cat) => {
+    const t = txns.find(x => x.id === id);
+    pushH(id, t.category, t.confirmed, phase);
+    setTxns(p => {
+      const u = p.map(x => x.id === id ? { ...x, category: cat, confirmed: true } : x);
+      const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize";
+      saveState(u, newPhase);
+      return u;
+    });
+    if (t && cat !== SKIP_CAT) saveMap({ ...mappings, [t.payee.toLowerCase()]: cat });
+
+    // Send category update to Google Sheet (fire-and-forget)
+    if (t && cat !== SKIP_CAT && t.sheetRow !== undefined) {
+      const webappUrl = storage.get("webapp-url");
+      if (webappUrl) {
+        fetch(webappUrl, {
+          method: "POST",
+          body: JSON.stringify({ updates: [{ row: t.sheetRow, category: cat }] })
+        }).catch(() => {});
+      }
+    }
+
+    if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200);
+  };
   const skip = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, phase); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: SKIP_CAT, confirmed: true } : x); const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize"; saveState(u, newPhase); return u; }); if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200); };
   const copy = () => { const rows = txns.filter(t => t.category && t.category !== SKIP_CAT).map(t => t.date + "\t" + t.payee + "\t" + t.category + "\t" + t.subDesc + "\t" + t.amount).join("\n"); navigator.clipboard.writeText(rows).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); }); };
 
-  if (phase === "input") return e(InputScreen, { onParse: handleParse, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, onDeleteSession: deleteSession, sessions });
+  if (showSettings) return e(SettingsModal, { onClose: () => setShowSettings(false), onSave: () => setShowSettings(false) });
+  if (phase === "input") return e(InputScreen, { onFetch: handleFetch, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, onDeleteSession: deleteSession, sessions, onSettingsOpen: () => setShowSettings(true) });
   if (phase === "manage") return e(ManageScreen, { categories, onAdd: cat => { if (categories.some(c => c.name.toLowerCase() === cat.name.toLowerCase())) return; const u = [...categories, cat]; setCategories(u); saveCats(u); }, onDelete: name => { const u = categories.filter(c => c.name !== name); setCategories(u); saveCats(u); }, onBack: () => setPhase("input") });
   if (phase === "confirm" && known.length > 0) return e(ConfirmScreen, { txn: known[0], onConfirm: confirm, onReject: reject, onSkipAll: () => { setTxns(p => { const u = p.map(t => t.category && !t.confirmed ? { ...t, confirmed: true } : t); saveState(u, unknown.length > 0 ? "categorize" : "summary"); return u; }); setPhase(unknown.length > 0 ? "categorize" : "summary"); }, onUndo: undo, canUndo: history.length > 0, remaining: known.length, total: initKnown });
   if ((phase === "categorize" || phase === "confirm") && unknown.length > 0) return e(CategorizeScreen, { txn: unknown[0], categories, onAssign: assign, onSkip: skip, onDone: () => setPhase("summary"), onUndo: undo, canUndo: history.length > 0, progress, remaining: unknown.length });
