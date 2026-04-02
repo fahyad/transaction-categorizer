@@ -75,7 +75,66 @@ function transformSheetTransaction(row) {
     subDesc: subDesc,
     category: null,
     sheetRow: row.row,
+    timeET: row.timeET || "",
+    transactionType: row.transactionType || "",
+    accountType: row.accountType || "",
   };
+}
+
+// Sync queue for POST updates with retry
+const syncManager = {
+  queue: [],
+  listeners: [],
+  subscribe(fn) { syncManager.listeners.push(fn); return () => { syncManager.listeners = syncManager.listeners.filter(l => l !== fn); }; },
+  notify() { syncManager.listeners.forEach(fn => fn({ pending: syncManager.queue.filter(i => i.status === "pending").length, failed: syncManager.queue.filter(i => i.status === "failed").length, total: syncManager.queue.length })); },
+  add(row, category) {
+    syncManager.queue.push({ row, category, status: "pending", retries: 0 });
+    syncManager.notify();
+    syncManager.flush();
+  },
+  async flush() {
+    const pending = syncManager.queue.filter(i => i.status === "pending" || i.status === "failed");
+    if (!pending.length) return;
+    const url = storage.get("webapp-url");
+    if (!url) return;
+    for (const item of pending) {
+      item.status = "sending";
+      syncManager.notify();
+      try {
+        const resp = await fetch(url, { method: "POST", body: JSON.stringify({ updates: [{ row: item.row, category: item.category }] }), redirect: "follow" });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        item.status = "done";
+        syncManager.notify();
+      } catch (err) {
+        item.retries++;
+        if (item.retries >= 3) { item.status = "failed"; } else { item.status = "pending"; }
+        syncManager.notify();
+        if (item.status === "pending") {
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, item.retries)));
+          syncManager.flush();
+          return;
+        }
+      }
+    }
+    syncManager.queue = syncManager.queue.filter(i => i.status !== "done");
+    syncManager.notify();
+  },
+  retryFailed() {
+    syncManager.queue.forEach(i => { if (i.status === "failed") { i.status = "pending"; i.retries = 0; } });
+    syncManager.notify();
+    syncManager.flush();
+  },
+  clearDone() { syncManager.queue = syncManager.queue.filter(i => i.status !== "done"); syncManager.notify(); }
+};
+
+function SyncIndicator() {
+  const [sync, setSync] = useState({ pending: 0, failed: 0, total: 0 });
+  useEffect(() => syncManager.subscribe(setSync), []);
+  if (sync.pending === 0 && sync.failed === 0) return null;
+  return e("div", { style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", zIndex: 999, display: "flex", gap: 8, alignItems: "center", background: sync.failed > 0 ? "#7F1D1D" : "#1E3A5F", border: "1px solid " + (sync.failed > 0 ? "#F87171" : "#3B82F6"), borderRadius: 10, padding: "8px 16px", fontSize: 12, fontWeight: 600 } },
+    sync.pending > 0 && e("span", { style: { color: "#93C5FD" } }, "\u21BB Syncing " + sync.pending + "..."),
+    sync.failed > 0 && e("span", { style: { color: "#F87171" } }, "\u26A0 " + sync.failed + " failed"),
+    sync.failed > 0 && e("button", { onClick: () => syncManager.retryFailed(), style: { background: "#F87171", border: "none", borderRadius: 6, color: "#FFF", padding: "4px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer", marginLeft: 4 } }, "Retry"));
 }
 
 const S = {
@@ -134,12 +193,33 @@ function SettingsModal({ onClose, onSave }) {
   );
 }
 
-function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDeleteSession, sessions, onSettingsOpen }) {
+function InputScreen({ onFetch, onCsvUpload, mappingCount, catCount, onManage, onResume, onDeleteSession, sessions, onSettingsOpen }) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [uncategorizedCount, setUncategorizedCount] = useState(null);
   const [showSessions, setShowSessions] = useState(false);
   const [confirmDelId, setConfirmDelId] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [peekLoading, setPeekLoading] = useState(false);
+  const [sortOrder, setSortOrder] = useState("newest");
+  const [accountFilter, setAccountFilter] = useState("all");
+
+  const doPeek = async () => {
+    const url = storage.get("webapp-url");
+    if (!url) return;
+    setPeekLoading(true);
+    try {
+      const response = await fetch(url, { redirect: "follow" });
+      const data = response.ok ? await response.json() : JSON.parse(await response.text());
+      if (data.transactions && Array.isArray(data.transactions)) {
+        const accounts = [...new Set(data.transactions.map(r => (r.accountType || "") + " " + (r.account || "")).filter(Boolean))];
+        setPreview({ count: data.transactions.length, accounts });
+      }
+    } catch (ex) {}
+    setPeekLoading(false);
+  };
+
+  useEffect(() => { doPeek(); }, []);
 
   const handleFetch = async () => {
     setLoading(true);
@@ -155,26 +235,26 @@ function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDe
       }
 
       const response = await fetch(url, { redirect: "follow" });
-      if (!response.ok) {
-        const text = await response.text();
-        try {
-          const data = JSON.parse(text);
-          if (!data.transactions || !Array.isArray(data.transactions)) throw new Error("Invalid response");
-          const txns = data.transactions.map(transformSheetTransaction);
-          setUncategorizedCount(txns.length);
-          onFetch(txns);
-        } catch (parseErr) {
-          setErr("Failed to parse response. Ensure the web app is deployed and returns JSON.");
-        }
-      } else {
-        const data = await response.json();
-        if (!data.transactions || !Array.isArray(data.transactions)) throw new Error("Invalid response");
-        const txns = data.transactions.map(transformSheetTransaction);
-        setUncategorizedCount(txns.length);
-        onFetch(txns);
+      const data = response.ok ? await response.json() : JSON.parse(await response.text());
+      if (!data.transactions || !Array.isArray(data.transactions)) throw new Error("Invalid response");
+      let txns = data.transactions.map(transformSheetTransaction);
+      // Apply account filter
+      if (accountFilter !== "all") {
+        txns = txns.filter(t => t.subDesc === accountFilter);
       }
+      // Apply sort
+      txns.sort((a, b) => {
+        const da = a.date || "", db = b.date || "";
+        return sortOrder === "newest" ? db.localeCompare(da) : da.localeCompare(db);
+      });
+      setUncategorizedCount(txns.length);
+      onFetch(txns);
     } catch (ex) {
-      setErr("Failed to fetch transactions: " + (ex.message || "Unknown error"));
+      if (ex.message === "Invalid response") {
+        setErr("Failed to parse response. Ensure the web app is deployed and returns JSON.");
+      } else {
+        setErr("Failed to fetch transactions: " + (ex.message || "Unknown error"));
+      }
     } finally {
       setLoading(false);
     }
@@ -233,14 +313,35 @@ function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDe
 
       e("div", { style: { ...S.txnCard } },
         e("div", { style: { fontSize: 13, color: "#9BA4B5", marginBottom: 8 } }, "Connected to:"),
-        e("div", { style: { fontSize: 14, fontWeight: 600, color: "#FFF", wordBreak: "break-all", marginBottom: 16, fontFamily: "monospace", background: "#1B1F3B", padding: 12, borderRadius: 6, minHeight: 40, display: "flex", alignItems: "center" } }, webappUrl || "Not configured"),
-        uncategorizedCount !== null && e("div", { style: { fontSize: 13, color: "#4ADE80", marginBottom: 12 } }, "\u2713 Found " + uncategorizedCount + " uncategorized transactions")),
+        e("div", { style: { fontSize: 14, fontWeight: 600, color: "#FFF", wordBreak: "break-all", marginBottom: 12, fontFamily: "monospace", background: "#1B1F3B", padding: 12, borderRadius: 6, minHeight: 40, display: "flex", alignItems: "center" } }, webappUrl || "Not configured"),
+        preview && e("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12 } },
+          e("span", { style: { fontSize: 22, fontWeight: 800, color: preview.count > 0 ? "#FBBF24" : "#4ADE80" } }, preview.count),
+          e("span", { style: { fontSize: 13, color: "#9BA4B5" } }, "uncategorized transaction" + (preview.count !== 1 ? "s" : "") + " pending"),
+          e("button", { onClick: doPeek, disabled: peekLoading, style: { background: "none", border: "none", color: "#6C63FF", cursor: "pointer", fontSize: 12, marginLeft: "auto" } }, peekLoading ? "..." : "\u21BB")),
+        uncategorizedCount !== null && e("div", { style: { fontSize: 13, color: "#4ADE80", marginBottom: 8 } }, "\u2713 Fetched " + uncategorizedCount + " transactions")),
+
+      preview && preview.accounts.length > 0 && e("div", { style: { ...S.txnCard, padding: "14px 16px", marginBottom: 12 } },
+        e("div", { style: { fontSize: 11, fontWeight: 700, color: "#9BA4B5", marginBottom: 8, textTransform: "uppercase" } }, "Filters"),
+        e("div", { style: { display: "flex", gap: 8, alignItems: "center", marginBottom: 10 } },
+          e("span", { style: { fontSize: 12, color: "#9BA4B5", flexShrink: 0 } }, "Account:"),
+          e("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
+            e("button", { onClick: () => setAccountFilter("all"), style: { ...S.groupPill, background: accountFilter === "all" ? "#6C63FF33" : "#1B1F3B", color: accountFilter === "all" ? "#6C63FF" : "#9BA4B5", borderColor: accountFilter === "all" ? "#6C63FF" : "#3D4470" } }, "All"),
+            preview.accounts.map(acc => e("button", { key: acc, onClick: () => setAccountFilter(acc), style: { ...S.groupPill, background: accountFilter === acc ? "#6C63FF33" : "#1B1F3B", color: accountFilter === acc ? "#6C63FF" : "#9BA4B5", borderColor: accountFilter === acc ? "#6C63FF" : "#3D4470" } }, acc)))),
+        e("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+          e("span", { style: { fontSize: 12, color: "#9BA4B5", flexShrink: 0 } }, "Sort:"),
+          e("button", { onClick: () => setSortOrder("newest"), style: { ...S.groupPill, background: sortOrder === "newest" ? "#6C63FF33" : "#1B1F3B", color: sortOrder === "newest" ? "#6C63FF" : "#9BA4B5", borderColor: sortOrder === "newest" ? "#6C63FF" : "#3D4470" } }, "Newest first"),
+          e("button", { onClick: () => setSortOrder("oldest"), style: { ...S.groupPill, background: sortOrder === "oldest" ? "#6C63FF33" : "#1B1F3B", color: sortOrder === "oldest" ? "#6C63FF" : "#9BA4B5", borderColor: sortOrder === "oldest" ? "#6C63FF" : "#3D4470" } }, "Oldest first"))),
 
       err && e("div", { style: { background: "#F8717122", border: "1px solid #F87171", borderRadius: 8, padding: "8px 12px", marginBottom: 16, color: "#F87171", fontSize: 13 } }, err),
 
       e("button", { onClick: handleFetch, disabled: loading || !webappUrl,
-        style: { ...S.primaryBtn, marginTop: 0, opacity: (loading || !webappUrl) ? 0.4 : 1, width: "100%", marginBottom: 16 } },
+        style: { ...S.primaryBtn, marginTop: 0, opacity: (loading || !webappUrl) ? 0.4 : 1, width: "100%", marginBottom: 12 } },
         loading ? "Fetching\u2026" : "Fetch Transactions \u2192"),
+
+      e("div", { style: { textAlign: "center", marginBottom: 16 } },
+        e("label", { style: { color: "#6B7280", fontSize: 12, cursor: "pointer", textDecoration: "underline" } },
+          "\u{1F4C4} Or import from CSV file",
+          e("input", { type: "file", accept: ".csv", style: { display: "none" }, onChange: (ev) => { if (ev.target.files[0]) onCsvUpload(ev.target.files[0]); } }))),
 
       mappingCount > 0 && e("p", { style: { color: "#4ADE80", fontSize: 12, marginBottom: 16, textAlign: "center" } }, "\u2713 " + mappingCount + " saved mappings"),
       e("button", { onClick: onManage, style: { background: "none", border: "1px solid #3D4470", borderRadius: 10, padding: 12, color: "#9BA4B5", fontSize: 13, cursor: "pointer", width: "100%", marginTop: 24 } }, "\u2699\uFE0F Manage Categories (" + catCount + ")")
@@ -303,25 +404,33 @@ function ManageScreen({ categories, onAdd, onDelete, onBack }) {
   );
 }
 
-function ConfirmScreen({ txn, onConfirm, onReject, onSkipAll, onUndo, canUndo, remaining, total }) {
+function ConfirmScreen({ knownTxns, onConfirmSelected, onRejectSelected, onSkipAll, remaining, total }) {
+  const [selected, setSelected] = useState(() => new Set(knownTxns.map(t => t.id)));
+  const toggle = (id) => setSelected(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const allSelected = selected.size === knownTxns.length;
+  const toggleAll = () => setSelected(allSelected ? new Set() : new Set(knownTxns.map(t => t.id)));
+
   return e("div", { style: S.screen },
     e("div", { style: { padding: "16px 20px" } },
       e("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 } },
-        e("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-          canUndo && e("button", { onClick: onUndo, style: S.undoBtn }, "\u21A9 Undo"),
-          e("span", { style: { color: "#9BA4B5", fontSize: 12 } }, "Quick Confirm \u2014 " + remaining + " known")),
-        e("button", { onClick: onSkipAll, style: { background: "none", border: "1px solid #3D4470", borderRadius: 6, color: "#9BA4B5", padding: "4px 10px", cursor: "pointer", fontSize: 11 } }, "Accept all \u2192")),
+        e("span", { style: { color: "#9BA4B5", fontSize: 12 } }, "Quick Confirm \u2014 " + remaining + " known"),
+        e("button", { onClick: toggleAll, style: { background: "none", border: "1px solid #3D4470", borderRadius: 6, color: "#9BA4B5", padding: "4px 10px", cursor: "pointer", fontSize: 11 } }, allSelected ? "Deselect all" : "Select all")),
       e("div", { style: S.progressBar }, e("div", { style: { background: "#4ADE80", height: "100%", width: ((total - remaining) / Math.max(total, 1) * 100) + "%", transition: "width 0.3s" } })),
-      e("div", { style: S.txnCard },
-        e("div", { style: { fontSize: 13, color: "#9BA4B5", marginBottom: 4, fontFamily: "monospace" } }, txn.date),
-        e("div", { style: { fontSize: 20, fontWeight: 700, marginBottom: 6 } }, txn.payee),
-        txn.subDesc && e("div", { style: { fontSize: 12, color: "#6B7280", marginBottom: 8 } }, txn.subDesc),
-        e("div", { style: { fontSize: 28, fontWeight: 800, color: txn.amount >= 0 ? "#4ADE80" : "#F87171" } }, "$" + Math.abs(txn.amount).toFixed(2)),
-        e("div", { style: { marginTop: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 } },
-          e("span", { style: { fontSize: 16, fontWeight: 700, color: "#9BA4B5" } }, "\u2192 " + txn.category))),
-      e("div", { style: { display: "flex", gap: 12, marginTop: 20 } },
-        e("button", { onClick: () => onReject(txn.id), style: { ...S.bigBtn, background: "#2A2F5A", color: "#F87171", flex: 1 } }, "\u2715 Wrong"),
-        e("button", { onClick: () => onConfirm(txn.id), style: { ...S.bigBtn, background: "#059669", color: "#FFF", flex: 2 } }, "\u2713 Correct"))
+      e("div", { style: { maxHeight: "55vh", overflowY: "auto", marginBottom: 12 } },
+        knownTxns.map(txn =>
+          e("div", { key: txn.id, onClick: () => toggle(txn.id), style: { ...S.txnCard, cursor: "pointer", border: selected.has(txn.id) ? "2px solid #4ADE80" : "2px solid transparent", padding: "14px 14px", marginBottom: 8 } },
+            e("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
+              e("div", { style: { width: 22, height: 22, borderRadius: 6, border: selected.has(txn.id) ? "2px solid #4ADE80" : "2px solid #3D4470", background: selected.has(txn.id) ? "#4ADE80" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 12, color: "#FFF" } }, selected.has(txn.id) ? "\u2713" : ""),
+              e("div", { style: { flex: 1, minWidth: 0 } },
+                e("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                  e("span", { style: { fontSize: 14, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, txn.payee),
+                  e("span", { style: { fontSize: 14, fontWeight: 700, color: txn.amount >= 0 ? "#4ADE80" : "#F87171", flexShrink: 0, paddingLeft: 8 } }, "$" + Math.abs(txn.amount).toFixed(2))),
+                e("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 2 } },
+                  e("span", { style: { fontSize: 11, color: "#9BA4B5", fontFamily: "monospace" } }, txn.date + (txn.timeET ? " \u00B7 " + txn.timeET : "")),
+                  e("span", { style: { fontSize: 11, color: "#6C63FF", fontWeight: 600 } }, "\u2192 " + txn.category))))))),
+      e("div", { style: { display: "flex", gap: 10 } },
+        e("button", { onClick: () => onRejectSelected([...selected]), disabled: selected.size === 0, style: { ...S.bigBtn, background: "#2A2F5A", color: "#F87171", flex: 1, opacity: selected.size === 0 ? 0.4 : 1 } }, "\u2715 Reject" + (selected.size > 0 ? " (" + selected.size + ")" : "")),
+        e("button", { onClick: () => onConfirmSelected([...selected]), disabled: selected.size === 0, style: { ...S.bigBtn, background: "#059669", color: "#FFF", flex: 2, opacity: selected.size === 0 ? 0.4 : 1 } }, "\u2713 Confirm" + (selected.size > 0 ? " (" + selected.size + ")" : "")))
     )
   );
 }
@@ -342,7 +451,9 @@ function CategorizeScreen({ txn, categories, onAssign, onSkip, onDone, onUndo, c
       e("div", { style: S.txnCard },
         e("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
           e("div", null,
-            e("div", { style: { fontSize: 12, color: "#9BA4B5", fontFamily: "monospace", marginBottom: 2 } }, txn.date),
+            e("div", { style: { display: "flex", alignItems: "center", gap: 6, marginBottom: 2 } },
+              e("span", { style: { fontSize: 12, color: "#9BA4B5", fontFamily: "monospace" } }, txn.date + (txn.timeET ? " \u00B7 " + txn.timeET : "")),
+              txn.transactionType && e("span", { style: { fontSize: 9, color: "#6C63FF", background: "#6C63FF22", borderRadius: 4, padding: "1px 5px", fontWeight: 600, textTransform: "capitalize" } }, txn.transactionType)),
             e("div", { style: { fontSize: 20, fontWeight: 700, lineHeight: 1.2 } }, txn.payee),
             txn.subDesc && e("div", { style: { fontSize: 12, color: "#6B7280", marginTop: 2 } }, txn.subDesc)),
           e("div", { style: { fontSize: 24, fontWeight: 800, color: txn.amount >= 0 ? "#4ADE80" : "#F87171", flexShrink: 0, paddingLeft: 12 } }, "$" + Math.abs(txn.amount).toFixed(2)))),
@@ -359,7 +470,9 @@ function CategorizeScreen({ txn, categories, onAssign, onSkip, onDone, onUndo, c
   );
 }
 
-function SummaryScreen({ transactions, categories, onCopy, onBack, onRestart, copied }) {
+function SummaryScreen({ transactions, categories, onCopy, onBack, onRestart, onRefresh, copied }) {
+  const [refreshing, setRefreshing] = useState(false);
+  const handleRefresh = async () => { setRefreshing(true); await onRefresh(); setRefreshing(false); };
   const catMap = Object.fromEntries(categories.map(c => [c.name, c]));
   const categorized = transactions.filter(t => t.category && t.category !== SKIP_CAT);
   const skipped = transactions.filter(t => t.category === SKIP_CAT);
@@ -385,6 +498,7 @@ function SummaryScreen({ transactions, categories, onCopy, onBack, onRestart, co
             e("span", { style: { fontSize: 14, fontWeight: 700, color: "#F87171", fontFamily: "monospace" } }, "$" + Math.abs(data.total).toFixed(2)));
         })),
       e("button", { onClick: onCopy, style: { ...S.primaryBtn, width: "100%", marginBottom: 10 } }, copied ? "\u2713 Copied to Clipboard!" : "\u{1F4CB} Copy " + categorized.length + " for Excel"),
+      e("button", { onClick: handleRefresh, disabled: refreshing, style: { ...S.bigBtn, width: "100%", background: "#2A2F5A", border: "1px solid #3D4470", color: "#93C5FD", marginBottom: 10, opacity: refreshing ? 0.5 : 1 } }, refreshing ? "\u21BB Checking..." : "\u21BB Check for New Transactions"),
       e("div", { style: { display: "flex", gap: 10 } },
         uncategorized.length > 0 && e("button", { onClick: onBack, style: { ...S.bigBtn, flex: 1, background: "#2A2F5A", color: "#FFF" } }, "\u2190 " + uncategorized.length + " remaining"),
         e("button", { onClick: onRestart, style: { ...S.bigBtn, flex: 1, background: "#1B1F3B", border: "1px solid #3D4470", color: "#9BA4B5" } }, "New Fetch"))
@@ -478,8 +592,26 @@ function App() {
   const done = txns.filter(t => t.confirmed || t.category === SKIP_CAT).length;
   const progress = txns.length > 0 ? (done / txns.length * 100) : 0;
 
-  const confirm = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, "confirm"); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, confirmed: true } : x); const newPhase = known.filter(x => x.id !== id).length === 0 ? (unknown.length > 0 ? "categorize" : "summary") : "confirm"; saveState(u, newPhase); return u; }); if (known.filter(x => x.id !== id).length === 0) setPhase(unknown.length > 0 ? "categorize" : "summary"); };
-  const reject = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, "confirm"); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: null, confirmed: false } : x); saveState(u, "confirm"); return u; }); };
+  const confirmSelected = (ids) => {
+    setTxns(p => {
+      const u = p.map(x => ids.includes(x.id) ? { ...x, confirmed: true } : x);
+      // Sync confirmed ones to sheet
+      ids.forEach(id => { const t = u.find(x => x.id === id); if (t && t.category !== SKIP_CAT && t.sheetRow !== undefined) syncManager.add(t.sheetRow, t.category); });
+      const remainingKnown = u.filter(t => t.category && t.category !== SKIP_CAT && !t.confirmed);
+      const remainingUnknown = u.filter(t => !t.category);
+      const newPhase = remainingKnown.length === 0 ? (remainingUnknown.length > 0 ? "categorize" : "summary") : "confirm";
+      saveState(u, newPhase);
+      setPhase(newPhase);
+      return u;
+    });
+  };
+  const rejectSelected = (ids) => {
+    setTxns(p => {
+      const u = p.map(x => ids.includes(x.id) ? { ...x, category: null, confirmed: false } : x);
+      saveState(u, "confirm");
+      return u;
+    });
+  };
   const assign = (id, cat) => {
     const t = txns.find(x => x.id === id);
     pushH(id, t.category, t.confirmed, phase);
@@ -491,15 +623,9 @@ function App() {
     });
     if (t && cat !== SKIP_CAT) saveMap({ ...mappings, [t.payee.toLowerCase()]: cat });
 
-    // Send category update to Google Sheet (fire-and-forget)
+    // Send category update to Google Sheet via sync manager
     if (t && cat !== SKIP_CAT && t.sheetRow !== undefined) {
-      const webappUrl = storage.get("webapp-url");
-      if (webappUrl) {
-        fetch(webappUrl, {
-          method: "POST",
-          body: JSON.stringify({ updates: [{ row: t.sheetRow, category: cat }] })
-        }).catch(() => {});
-      }
+      syncManager.add(t.sheetRow, cat);
     }
 
     if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200);
@@ -507,12 +633,73 @@ function App() {
   const skip = id => { const t = txns.find(x => x.id === id); pushH(id, t.category, t.confirmed, phase); setTxns(p => { const u = p.map(x => x.id === id ? { ...x, category: SKIP_CAT, confirmed: true } : x); const newPhase = unknown.filter(x => x.id !== id).length === 0 ? "summary" : "categorize"; saveState(u, newPhase); return u; }); if (unknown.filter(x => x.id !== id).length === 0) setTimeout(() => setPhase("summary"), 200); };
   const copy = () => { const rows = txns.filter(t => t.category && t.category !== SKIP_CAT).map(t => t.date + "\t" + t.payee + "\t" + t.category + "\t" + t.subDesc + "\t" + t.amount).join("\n"); navigator.clipboard.writeText(rows).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2500); }); };
 
-  if (showSettings) return e(SettingsModal, { onClose: () => setShowSettings(false), onSave: () => setShowSettings(false) });
-  if (phase === "input") return e(InputScreen, { onFetch: handleFetch, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, onDeleteSession: deleteSession, sessions, onSettingsOpen: () => setShowSettings(true) });
-  if (phase === "manage") return e(ManageScreen, { categories, onAdd: cat => { if (categories.some(c => c.name.toLowerCase() === cat.name.toLowerCase())) return; const u = [...categories, cat]; setCategories(u); saveCats(u); }, onDelete: name => { const u = categories.filter(c => c.name !== name); setCategories(u); saveCats(u); }, onBack: () => setPhase("input") });
-  if (phase === "confirm" && known.length > 0) return e(ConfirmScreen, { txn: known[0], onConfirm: confirm, onReject: reject, onSkipAll: () => { setTxns(p => { const u = p.map(t => t.category && !t.confirmed ? { ...t, confirmed: true } : t); saveState(u, unknown.length > 0 ? "categorize" : "summary"); return u; }); setPhase(unknown.length > 0 ? "categorize" : "summary"); }, onUndo: undo, canUndo: history.length > 0, remaining: known.length, total: initKnown });
-  if ((phase === "categorize" || phase === "confirm") && unknown.length > 0) return e(CategorizeScreen, { txn: unknown[0], categories, onAssign: assign, onSkip: skip, onDone: () => setPhase("summary"), onUndo: undo, canUndo: history.length > 0, progress, remaining: unknown.length });
-  return e(SummaryScreen, { transactions: txns, categories, onCopy: copy, onBack: () => setPhase("categorize"), onRestart: () => { setTxns([]); setPhase("input"); setCopied(false); setHistory([]); setActiveSessionId(null); setSessions(storage.get("saved-sessions") || []); }, copied });
+  const handleRefresh = async () => {
+    const url = storage.get("webapp-url");
+    if (!url) return;
+    try {
+      const response = await fetch(url, { redirect: "follow" });
+      const data = await response.json();
+      if (!data.transactions || !Array.isArray(data.transactions)) return;
+      const newTxns = data.transactions.map(transformSheetTransaction);
+      const existingIds = new Set(txns.map(t => t.id));
+      const fresh = newTxns.filter(t => !existingIds.has(t.id));
+      if (fresh.length === 0) return;
+      const withMappings = fresh.map(t => { const s = mappings[t.payee.toLowerCase()]; return s ? { ...t, category: s } : t; });
+      setTxns(p => {
+        const merged = [...p, ...withMappings];
+        const newKnown = withMappings.filter(t => t.category);
+        setInitKnown(prev => prev + newKnown.length);
+        const hasUnconfirmed = withMappings.some(t => t.category && !t.confirmed);
+        const hasUnknown = withMappings.some(t => !t.category);
+        const newPhase = hasUnconfirmed ? "confirm" : (hasUnknown ? "categorize" : phase);
+        saveState(merged, newPhase);
+        setPhase(newPhase);
+        return merged;
+      });
+    } catch (ex) {}
+  };
+
+  const handleCsvUpload = (file) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target.result;
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 2) return;
+      const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
+      const dateIdx = headers.findIndex(h => h === "date");
+      const amountIdx = headers.findIndex(h => h === "amount");
+      const payeeIdx = headers.findIndex(h => h === "payee" || h === "merchant" || h === "description" || h === "name");
+      const catIdx = headers.findIndex(h => h === "category");
+      if (dateIdx < 0 || amountIdx < 0 || payeeIdx < 0) return;
+      const parsed = lines.slice(1).map((line, i) => {
+        const cols = line.split(",").map(c => c.trim().replace(/^"(.*)"$/, "$1"));
+        return {
+          id: "csv-" + i,
+          date: cols[dateIdx] || "",
+          amount: parseFloat(cols[amountIdx]) || 0,
+          payee: cols[payeeIdx] || "",
+          rawDesc: cols[payeeIdx] || "",
+          subDesc: "",
+          category: (catIdx >= 0 && cols[catIdx]) ? cols[catIdx] : null,
+          timeET: "",
+          transactionType: "",
+          accountType: "",
+        };
+      }).filter(t => t.payee);
+      if (parsed.length > 0) handleFetch(parsed);
+    };
+    reader.readAsText(file);
+  };
+
+  const syncIndicator = e(SyncIndicator);
+  const wrap = (content) => e(React.Fragment, null, content, syncIndicator);
+
+  if (showSettings) return wrap(e(SettingsModal, { onClose: () => setShowSettings(false), onSave: () => setShowSettings(false) }));
+  if (phase === "input") return wrap(e(InputScreen, { onFetch: handleFetch, onCsvUpload: handleCsvUpload, mappingCount: Object.keys(mappings).length, catCount: categories.length, onManage: () => setPhase("manage"), onResume: handleResume, onDeleteSession: deleteSession, sessions, onSettingsOpen: () => setShowSettings(true) }));
+  if (phase === "manage") return wrap(e(ManageScreen, { categories, onAdd: cat => { if (categories.some(c => c.name.toLowerCase() === cat.name.toLowerCase())) return; const u = [...categories, cat]; setCategories(u); saveCats(u); }, onDelete: name => { const u = categories.filter(c => c.name !== name); setCategories(u); saveCats(u); }, onBack: () => setPhase("input") }));
+  if (phase === "confirm" && known.length > 0) return wrap(e(ConfirmScreen, { knownTxns: known, onConfirmSelected: confirmSelected, onRejectSelected: rejectSelected, onSkipAll: () => { setTxns(p => { const u = p.map(t => t.category && !t.confirmed ? { ...t, confirmed: true } : t); saveState(u, unknown.length > 0 ? "categorize" : "summary"); return u; }); setPhase(unknown.length > 0 ? "categorize" : "summary"); }, remaining: known.length, total: initKnown }));
+  if ((phase === "categorize" || phase === "confirm") && unknown.length > 0) return wrap(e(CategorizeScreen, { txn: unknown[0], categories, onAssign: assign, onSkip: skip, onDone: () => setPhase("summary"), onUndo: undo, canUndo: history.length > 0, progress, remaining: unknown.length }));
+  return wrap(e(SummaryScreen, { transactions: txns, categories, onCopy: copy, onRefresh: handleRefresh, onBack: () => setPhase("categorize"), onRestart: () => { setTxns([]); setPhase("input"); setCopied(false); setHistory([]); setActiveSessionId(null); setSessions(storage.get("saved-sessions") || []); }, copied }));
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(e(App));
