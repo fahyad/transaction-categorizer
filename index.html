@@ -68,7 +68,7 @@ function transformSheetTransaction(row) {
   const subDesc = (row.accountType || "") + (row.accountType && row.account ? " " : "") + (row.account || "");
   return {
     id: String(row.row),
-    date: row.date ? (typeof row.date === "string" ? row.date : new Date(row.date).toISOString().split("T")[0]) : "",
+    date: row.date ? (typeof row.date === "string" ? row.date.split("T")[0] : new Date(row.date).toISOString().split("T")[0]) : "",
     amount: amt,
     payee: payee,
     rawDesc: merchant,
@@ -154,7 +154,8 @@ function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDe
         return;
       }
 
-      const response = await fetch(url, { redirect: "follow" });
+      const fetchUrl = url + (url.includes("?") ? "&" : "?") + "action=parseAndFetch";
+      const response = await fetch(fetchUrl, { redirect: "follow" });
       if (!response.ok) {
         const text = await response.text();
         try {
