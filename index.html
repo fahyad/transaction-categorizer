@@ -224,7 +224,7 @@ function InputScreen({ onFetch, mappingCount, catCount, onManage, onResume, onDe
             return e("div", { key: s.id, style: { background: "#2A2F5A", borderRadius: 10, borderLeft: "4px solid #4ADE80", padding: "14px 16px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12 } },
               e("div", { style: { flex: 1, cursor: "pointer", minWidth: 0 }, onClick: () => onResume(s.id) },
                 e("div", { style: { fontSize: 14, fontWeight: 700, color: "#FFF", marginBottom: 4 } }, sessionLabel(s.txns)),
-                e("div", { style: { fontSize: 12, color: "#9BA4B5" } }, st.total + " transactions \u00B7 all categorized")),
+                e("div", { style: { fontSize: 12, color: "#9BA4B5" } }, st.total + " transactions \u00B7 " + st.catd + " categorized" + (st.skipped > 0 ? " \u00B7 " + st.skipped + " skipped" : ""))),
               confirmDelId === s.id ?
                 e("div", { style: { display: "flex", flexDirection: "column", gap: 4, flexShrink: 0 } },
                   e("button", { onClick: () => { onDeleteSession(s.id); setConfirmDelId(null); }, style: { background: "#F87171", border: "none", borderRadius: 4, color: "#FFF", padding: "4px 10px", fontSize: 11, cursor: "pointer", fontWeight: 600 } }, "Delete"),
